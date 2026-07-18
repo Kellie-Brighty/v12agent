@@ -55,7 +55,7 @@ async function fetchBars(symbol: string, timeframe = '1Min', limit = MAX_CANDLES
 
 async function refreshHTFBars(): Promise<void> {
   for (const s of SYMBOLS) {
-    const bars = await fetchBars(s, '1Hour', 50);
+    const bars = await fetchBars(s, '15Min', 50);
     if (bars.length > 0) htfStore[s] = bars;
   }
 }
@@ -154,17 +154,17 @@ async function start() {
     console.log(`  📊 ${s}: ${store[s].length} bars`);
   }));
 
-  console.log('🔄 Loading 1-hour HTF bars (for bias)...');
+  console.log('🔄 Loading 15-minute HTF bars (for bias)...');
   await refreshHTFBars();
   for (const s of SYMBOLS) {
-    console.log(`  📈 ${s}: ${htfStore[s]!.length} 1H bars`);
+    console.log(`  📈 ${s}: ${htfStore[s]!.length} 15m bars`);
   }
 
-  // Refresh HTF bars every hour
+  // Refresh HTF bars every 15 minutes
   setInterval(() => {
     refreshHTFBars().catch(console.error);
     console.log('🔁 HTF bars refreshed');
-  }, 60 * 60 * 1000);
+  }, 15 * 60 * 1000);
 
   connectStream();
   console.log(`\n🚀 V12Agent proxy live on ws://localhost:${server.port}\n`);

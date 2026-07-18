@@ -12,7 +12,9 @@
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^4.0.1",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "firebase-admin": "^14.2.0",
+    "openai": "^6.48.0"
   },
   "scripts": {
     "start": "bun run index.ts",

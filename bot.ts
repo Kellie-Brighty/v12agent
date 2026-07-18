@@ -20,16 +20,17 @@ dotenv.config();
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
-export const BOT_CONFIG = {
-  DRY_RUN:            true,    // true = log signals only, false = place real orders
-  RISK_PERCENT:       0.01,    // 1% of account per trade
-  SWING_LOOKBACK:     5,       // Candles on each side to confirm a swing point (1-min)
-  HTF_SWING_LOOKBACK: 3,       // Lookback for swing detection on 1H bars
-  MIN_FVG_PIPS:       0.0008,  // FVG must be at least 0.08% of price to be valid
-  MIN_RR:             1.5,     // Minimum Risk:Reward ratio to take a trade
-  FVG_PROXIMITY:      3.0,     // Price must be within 3x FVG range to trigger entry
-  MIN_SWEEP_DISTANCE: 0.0005,  // Wick must reach at least 0.05% beyond the swing level
-};
+import { getConfig, type BotConfig } from './config_manager';
+import { logTradeEvent, logObservationEvent, type TradeContext } from './memory';
+
+export const BOT_CONFIG = new Proxy({} as BotConfig, {
+  get: (_, prop: string | symbol) => {
+    if (typeof prop === 'string') {
+      return getConfig()[prop as keyof BotConfig];
+    }
+    return undefined;
+  }
+});
 
 // Kill zones (UTC hours — crypto trades 24/7 so these still apply)
 const KILL_ZONES = [
@@ -364,7 +365,7 @@ function calcQty(balance: number, riskPct: number, entry: number, stop: number):
 
 // ─── onBar — Entry Point (called from server.ts after each completed bar) ──
 //   candles    = 1-min bars  → sweep, FVG, entry detection
-//   htfCandles = 1-hour bars → market bias only (more reliable structure)
+//   htfCandles = 15-min bars → market bias only (more reliable structure)
 
 export async function onBar(
   symbol:     string,
@@ -380,30 +381,61 @@ export async function onBar(
   // Heartbeat — always visible so we know the bot is alive
   console.log(`${prefix} 🕯  Bar closed @ $${last.close.toFixed(2)} | ${timeStr}`);
 
-  // ── 1. Kill Zone filter ─────────────────────────────────────────────────
   const kz = getKillZone(last.time);
-  if (!kz.active) {
-    console.log(`${prefix} ⏹  Outside kill zone — skipping\n`);
+
+  // ── 2. Already in a position? Check TP/SL ──────────────────────────────
+  const openPos = openPositions.get(symbol);
+  if (openPos) {
+    let closed = false;
+    let outcome: 'win' | 'loss' = 'loss';
+    
+    if (openPos.side === 'long') {
+      if (last.low <= openPos.stopLoss) {
+        console.log(`${prefix} 🛑 STOP LOSS HIT for LONG`);
+        closed = true; outcome = 'loss';
+      } else if (last.high >= openPos.takeProfit) {
+        console.log(`${prefix} 🎯 TAKE PROFIT HIT for LONG`);
+        closed = true; outcome = 'win';
+      }
+    } else {
+      if (last.high >= openPos.stopLoss) {
+        console.log(`${prefix} 🛑 STOP LOSS HIT for SHORT`);
+        closed = true; outcome = 'loss';
+      } else if (last.low <= openPos.takeProfit) {
+        console.log(`${prefix} 🎯 TAKE PROFIT HIT for SHORT`);
+        closed = true; outcome = 'win';
+      }
+    }
+    
+    if (closed) {
+      const tContext: TradeContext = {
+        symbol,
+        entryPrice: openPos.entry,
+        stopLoss: openPos.stopLoss,
+        takeProfit: openPos.takeProfit,
+        setupType: openPos.side === 'long' ? 'bullish_fvg' : 'bearish_fvg',
+        htfBias: 'unknown',
+        killZone: kz.name || 'unknown'
+      };
+      logTradeEvent(tContext, outcome, candles);
+      clearPosition(symbol);
+    } else {
+      console.log(`${prefix} 🔒 Position open — skipping\n`);
+    }
     return;
   }
 
-  // ── 2. Already in a position? ───────────────────────────────────────────
-  if (openPositions.has(symbol)) {
-    console.log(`${prefix} 🔒 Position already open — skipping\n`);
-    return;
-  }
-
-  // ── 3. Bias from 1H HTF (fallback to 1-min if not enough HTF data) ──────
+  // ── 3. Bias from 15m HTF (fallback to 1-min if not enough HTF data) ──────
   const useHTF      = htfCandles.length >= 10;
   const biasCandles = useHTF ? htfCandles : candles;
-  const biasLabel   = useHTF ? '1H' : '1min';
+  const biasLabel   = useHTF ? '15m' : '1min';
   const htfSwings   = detectSwings(biasCandles, BOT_CONFIG.HTF_SWING_LOOKBACK);
   const bias        = getMarketBias(htfSwings);
 
   // Keep separate 1-min swings for sweep & FVG detection
   const ltfSwings = detectSwings(candles);
 
-  console.log(`${prefix} 📐 Bias: ${bias.toUpperCase()} [${biasLabel}] | Kill zone: ${kz.name}`);
+  console.log(`${prefix} 📐 Bias: ${bias.toUpperCase()} [${biasLabel}] | Kill zone: ${kz.name || 'Dead Zone'}`);
 
   if (bias === 'ranging') {
     console.log(`${prefix} 📊 HTF market ranging — no trade\n`);
@@ -449,8 +481,12 @@ export async function onBar(
   console.log(`${prefix} 🟦 FVG found: $${fvg.bottom.toFixed(2)} – $${fvg.top.toFixed(2)} (${fvg.type})`);
 
   // Price must be near or inside the FVG
-  if (Math.abs(last!.close - fvgMid) > fvgRange * BOT_CONFIG.FVG_PROXIMITY) {
-    console.log(`${prefix} 📍 Price $${last!.close.toFixed(2)} not yet at FVG — waiting for retracement\n`);
+  const proximityRatio = Math.abs(last!.close - fvgMid) / fvgRange;
+  if (proximityRatio <= BOT_CONFIG.FVG_PROXIMITY) {
+    // ... (Execute Trade logic below)
+  } else {
+    console.log(`${prefix} ⚠️ FVG proximity check failed (Ratio: ${proximityRatio.toFixed(2)})`);
+    logObservationEvent(`FVG proximity check failed (Ratio: ${proximityRatio.toFixed(2)})`, symbol, candles);
     return;
   }
 
@@ -476,16 +512,14 @@ export async function onBar(
   }
 
   // ── 7. Risk / Reward check ──────────────────────────────────────────────
-  const risk   = Math.abs(entry - stopLoss);
-  const reward = Math.abs(entry - takeProfit);
-  const rr     = reward / risk;
-
-  console.log(`${prefix} ⚖️  R:R = ${rr.toFixed(2)}:1 (min ${BOT_CONFIG.MIN_RR}:1)`);
-
+  const rr = Math.abs(takeProfit - entry) / Math.abs(entry - stopLoss);
   if (rr < BOT_CONFIG.MIN_RR) {
-    console.log(`${prefix} ❌ R:R too low — skipping trade\n`);
+    console.log(`${prefix} ⚠️ R:R too low (${rr.toFixed(2)}). Skipping trade.`);
+    logObservationEvent(`Setup valid but R:R too low (${rr.toFixed(2)})`, symbol, candles);
     return;
   }
+
+  console.log(`${prefix} ⚖️  R:R = ${rr.toFixed(2)}:1 (min ${BOT_CONFIG.MIN_RR}:1)`);
 
   // ── 8. Position sizing ──────────────────────────────────────────────────
   const balance = await getAccountBalance();
@@ -514,10 +548,17 @@ export async function onBar(
   console.log(`  Balance:     $${balance.toFixed(2)}`);
   console.log('━'.repeat(60) + '\n');
 
-  // ── 10. Place order ─────────────────────────────────────────────────────
+  // ── 10. Kill Zone Final Check ───────────────────────────────────────────
+  if (!kz.active) {
+    console.log(`${prefix} ⏹ Setup is perfectly valid, but we are in a Dead Zone. Logging observation.\n`);
+    logObservationEvent('Valid setup formed in Dead Zone. Skipping execution.', symbol, candles);
+    return;
+  }
+
+  // ── 11. Place order ─────────────────────────────────────────────────────
   await placeOrder(setup);
 
-  // ── 11. Track open position ─────────────────────────────────────────────
+  // ── 12. Track open position ─────────────────────────────────────────────
   openPositions.set(symbol, {
     symbol,
     side:       side === 'buy' ? 'long' : 'short',

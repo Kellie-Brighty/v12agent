@@ -1,0 +1,7 @@
+{
+  "MIN_SWEEP_DISTANCE": 200,
+  "MIN_FVG_PIPS": 10,
+  "RISK_PERCENT": 1,
+  "MIN_RR": 2,
+  "FVG_PROXIMITY": 5
+}
