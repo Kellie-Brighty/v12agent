@@ -17,7 +17,7 @@
     "openai": "^6.48.0"
   },
   "scripts": {
-    "start": "bun run index.ts",
+    "start": "node api.js && bun run index.ts",
     "server": "bun --watch server.ts"
   }
 }
