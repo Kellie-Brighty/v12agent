@@ -7,7 +7,7 @@ const API_KEY    = process.env.ALPACA_API_KEY_ID!;
 const API_SECRET = process.env.ALPACA_API_SECRET_KEY!;
 const STREAM_URL = 'wss://stream.data.alpaca.markets/v1beta3/crypto/us';
 const DATA_URL   = 'https://data.alpaca.markets/v1beta3/crypto/us';
-const SYMBOLS    = ['BTC/USD', 'ETH/USD', 'SOL/USD'] as const;
+const SYMBOLS    = ['BTC/USD'] as const;
 const MAX_CANDLES = 100;
 const PORT        = 3001;
 

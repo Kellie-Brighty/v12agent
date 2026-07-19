@@ -22,6 +22,7 @@ dotenv.config();
 
 import { getConfig, type BotConfig } from './config_manager';
 import { logTradeEvent, logObservationEvent, type TradeContext } from './memory';
+import { analyzeLTFStructure } from './brain';
 
 export const BOT_CONFIG = new Proxy({} as BotConfig, {
   get: (_, prop: string | symbol) => {
@@ -110,7 +111,10 @@ interface Position {
 
 // ─── In-Memory State ───────────────────────────────────────────────────────
 
-const openPositions = new Map<string, Position>();
+const openPositions  = new Map<string, Position>();
+const lastSwingCount = new Map<string, number>(); // track swing count per symbol for tape-read trigger
+const lastTapeReadAt = new Map<string, number>(); // unix seconds of last tape read per symbol
+const lastKeyLevel   = new Map<string, number>(); // the Brain's most recent key_level_to_watch per symbol
 
 // ─── Kill Zone ─────────────────────────────────────────────────────────────
 
@@ -221,6 +225,38 @@ export function detectFVGs(candles: Candle[]): FVG[] {
   return fvgs;
 }
 
+// ─── Displacement Detection ────────────────────────────────────────────────────
+// ICT 2022: An FVG only has institutional significance if it was created by a
+// DISPLACEMENT candle — a single strong impulsive move with a large body and
+// minimal wicks. This filters out FVGs created by slow chop or drift.
+
+export function detectDisplacement(
+  candles: Candle[],
+  fvgCandleIndex: number, // the index of the middle (impulse) candle of the FVG
+  minBodyRatio = 0.6,     // body must be at least 60% of total candle range
+  minRangeMultiplier = 1.5, // candle range must be 1.5x the recent ATR
+): boolean {
+  const impulse = candles[fvgCandleIndex];
+  if (!impulse) return false;
+
+  const totalRange = impulse.high - impulse.low;
+  if (totalRange === 0) return false;
+
+  // 1. Body ratio: is this a strong decisive candle?
+  const body = Math.abs(impulse.close - impulse.open);
+  const bodyRatio = body / totalRange;
+  if (bodyRatio < minBodyRatio) return false;
+
+  // 2. Range vs ATR: is this candle significantly larger than recent candles?
+  const lookback = candles.slice(Math.max(0, fvgCandleIndex - 10), fvgCandleIndex);
+  if (lookback.length < 3) return true; // not enough data, allow through
+  const avgRange = lookback.reduce((sum, c) => sum + (c.high - c.low), 0) / lookback.length;
+  if (avgRange === 0) return true;
+  if (totalRange < avgRange * minRangeMultiplier) return false;
+
+  return true;
+}
+
 // ─── Order Block Detection ─────────────────────────────────────────────────
 
 export function detectOrderBlocks(candles: Candle[], swings: SwingPoint[]): OrderBlock[] {
@@ -264,10 +300,10 @@ export function detectLiquiditySweep(
   const recentSwingHighs = swings.filter(s => s.type === 'high').slice(-6);
 
   // Bullish sweep: wick BELOW a prior swing low, CLOSES ABOVE it
-  // Wick must penetrate at least MIN_SWEEP_DISTANCE beyond the level
   for (const sl of recentSwingLows) {
-    const threshold = sl.price * (1 - BOT_CONFIG.MIN_SWEEP_DISTANCE);
-    if (last.low <= threshold && last.close > sl.price) {
+    // Only require a minimal 1-pip sweep to trigger, rather than a strict percentage
+    const threshold = sl.price * 0.99995; 
+    if (last.low <= threshold && last.close >= sl.price) {
       return {
         time:        last.time,
         type:        'sweep_low',
@@ -279,10 +315,9 @@ export function detectLiquiditySweep(
   }
 
   // Bearish sweep: wick ABOVE a prior swing high, CLOSES BELOW it
-  // Wick must penetrate at least MIN_SWEEP_DISTANCE beyond the level
   for (const sh of recentSwingHighs) {
-    const threshold = sh.price * (1 + BOT_CONFIG.MIN_SWEEP_DISTANCE);
-    if (last.high >= threshold && last.close < sh.price) {
+    const threshold = sh.price * 1.00005;
+    if (last.high >= threshold && last.close <= sh.price) {
       return {
         time:        last.time,
         type:        'sweep_high',
@@ -437,6 +472,41 @@ export async function onBar(
 
   console.log(`${prefix} 📐 Bias: ${bias.toUpperCase()} [${biasLabel}] | Kill zone: ${kz.name || 'Dead Zone'}`);
 
+  // ── Swing-change detector → Tape Read trigger ──────────────────────────
+  const prevCount   = lastSwingCount.get(symbol) ?? 0;
+  const lastReadAt  = lastTapeReadAt.get(symbol) ?? 0;
+  const now         = last.time;
+  const newSwing    = ltfSwings.length > prevCount;
+  const timedOut    = (now - lastReadAt) >= 5 * 60; // 5 minutes fallback
+
+  // ── Key Level Breakout check ──────────────────────────────────────────────────
+  // If price has crossed the Brain's own flagged key level, fire immediately.
+  const trackedLevel = lastKeyLevel.get(symbol);
+  if (trackedLevel && !newSwing && !timedOut) {
+    const prevClose = candles[candles.length - 2]?.close ?? last.close;
+    const crossed   = (prevClose < trackedLevel && last.close >= trackedLevel)
+                   || (prevClose > trackedLevel && last.close <= trackedLevel);
+    if (crossed) {
+      const dir = last.close >= trackedLevel ? 'UP through' : 'DOWN through';
+      console.log(`${prefix} 🚨 Price crossed Brain's key level $${trackedLevel.toFixed(2)} (${dir}) — firing immediate tape read!`);
+      lastTapeReadAt.set(symbol, now);
+      lastKeyLevel.delete(symbol); // reset — Brain will set a new one after analysis
+      analyzeLTFStructure(symbol, ltfSwings, htfSwings, bias, kz.name || 'Dead Zone', candles)
+        .then(kl => { if (kl) lastKeyLevel.set(symbol, kl); })
+        .catch(console.error);
+    }
+  }
+
+  if (newSwing || timedOut) {
+    lastSwingCount.set(symbol, ltfSwings.length);
+    lastTapeReadAt.set(symbol, now);
+    if (!newSwing) console.log(`${prefix} ⏰ 5-min timeout — triggering tape read despite no new swing`);
+    // Fire async — capture returned key level to track
+    analyzeLTFStructure(symbol, ltfSwings, htfSwings, bias, kz.name || 'Dead Zone', candles)
+      .then(kl => { if (kl) lastKeyLevel.set(symbol, kl); })
+      .catch(console.error);
+  }
+
   if (bias === 'ranging') {
     console.log(`${prefix} 📊 HTF market ranging — no trade\n`);
     return;
@@ -453,11 +523,13 @@ export async function onBar(
 
   // Sweep must align with bias
   if (bias === 'bullish' && sweep.type !== 'sweep_low') {
-    console.log(`${prefix} ↕️  Sweep detected (${sweep.type}) but doesn't align with ${bias} bias — skipping\n`);
+    console.log(`${prefix} ↕️  Sweep detected (${sweep.type}) but doesn't align with ${bias} bias. Logging observation.\n`);
+    logObservationEvent(`Counter-trend sweep: ${sweep.type} in a ${bias} market.`, symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
     return;
   }
   if (bias === 'bearish' && sweep.type !== 'sweep_high') {
-    console.log(`${prefix} ↕️  Sweep detected (${sweep.type}) but doesn't align with ${bias} bias — skipping\n`);
+    console.log(`${prefix} ↕️  Sweep detected (${sweep.type}) but doesn't align with ${bias} bias. Logging observation.\n`);
+    logObservationEvent(`Counter-trend sweep: ${sweep.type} in a ${bias} market.`, symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
     return;
   }
 
@@ -475,6 +547,18 @@ export async function onBar(
   }
 
   const fvg      = fvgs[fvgs.length - 1]!;
+
+  // ── 5b. Displacement check ────────────────────────────────────────────────
+  // The FVG must have been created by a strong impulsive displacement candle.
+  // FVGs from slow drift/chop are meaningless per ICT 2022 mentorship.
+  const fvgImpulseIndex = sweep.candleIndex - 1 + (fvg.candleIndex - Math.max(0, sweep.candleIndex - 2) + 1);
+  const isDisplacement = detectDisplacement(candles, fvg.candleIndex - 1);
+  if (!isDisplacement) {
+    console.log(`${prefix} ⚠️ FVG found but NO displacement — slow chop FVG rejected. Logging observation.\n`);
+    logObservationEvent(`FVG rejected: no displacement candle (slow chop)`, symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
+    return;
+  }
+  console.log(`${prefix} ⚡ Displacement confirmed — FVG is institutionally valid`);
   const fvgRange = fvg.top - fvg.bottom;
   const fvgMid   = fvg.bottom + fvgRange / 2;
 
@@ -486,7 +570,7 @@ export async function onBar(
     // ... (Execute Trade logic below)
   } else {
     console.log(`${prefix} ⚠️ FVG proximity check failed (Ratio: ${proximityRatio.toFixed(2)})`);
-    logObservationEvent(`FVG proximity check failed (Ratio: ${proximityRatio.toFixed(2)})`, symbol, candles);
+    logObservationEvent(`FVG proximity check failed (Ratio: ${proximityRatio.toFixed(2)})`, symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
     return;
   }
 
@@ -515,7 +599,7 @@ export async function onBar(
   const rr = Math.abs(takeProfit - entry) / Math.abs(entry - stopLoss);
   if (rr < BOT_CONFIG.MIN_RR) {
     console.log(`${prefix} ⚠️ R:R too low (${rr.toFixed(2)}). Skipping trade.`);
-    logObservationEvent(`Setup valid but R:R too low (${rr.toFixed(2)})`, symbol, candles);
+    logObservationEvent(`Setup valid but R:R too low (${rr.toFixed(2)})`, symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
     return;
   }
 
@@ -549,9 +633,9 @@ export async function onBar(
   console.log('━'.repeat(60) + '\n');
 
   // ── 10. Kill Zone Final Check ───────────────────────────────────────────
-  if (!kz.active) {
+  if (!kz.active && !BOT_CONFIG.TRADE_DEAD_ZONES) {
     console.log(`${prefix} ⏹ Setup is perfectly valid, but we are in a Dead Zone. Logging observation.\n`);
-    logObservationEvent('Valid setup formed in Dead Zone. Skipping execution.', symbol, candles);
+    logObservationEvent('Valid setup formed in Dead Zone. Skipping execution.', symbol, candles, { killZone: kz.name || 'Dead Zone', htfBias: bias });
     return;
   }
 
