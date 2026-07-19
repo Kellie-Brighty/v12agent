@@ -22,6 +22,7 @@ async function callDeepSeek(
         messages,
         response_format: { type: 'json_object' },
         temperature,
+        max_tokens: 1000,
       });
       const text = response.choices[0]?.message?.content;
       if (!text || text.trim() === '') {
@@ -110,7 +111,7 @@ TRADE CONTEXT:
 - Take Profit: ${context.takeProfit}
 
 RECENT 1M CANDLE DATA (JSON):
-${JSON.stringify(candles.map(c => ({ t: new Date(c.time).toISOString(), o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume }))) }
+${JSON.stringify(candles.slice(-10).map(c => ({ t: new Date(c.time).toISOString(), o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume }))) }
 
 ${memoryBlock}
 `;
@@ -181,8 +182,8 @@ export async function analyzeLTFStructure(
       price: s.price.toFixed(2),
     }));
 
-  // ── CURRENT TAPE: last 15 1m candles (most recent price action) ──
-  const recentBars = recentCandles.slice(-15).map(c => ({
+  // ── CURRENT TAPE: last 10 1m candles (most recent price action) ──
+  const recentBars = recentCandles.slice(-10).map(c => ({
     t: new Date(c.time * 1000).toUTCString(),
     o: c.open.toFixed(2),
     h: c.high.toFixed(2),
@@ -229,7 +230,7 @@ ${JSON.stringify(htfSwingData, null, 2)}
 ━━━ MICRO CONTEXT (1m LTF swings — last 30 min only) ━━━━━━━━━
 ${recentLtfSwings.length > 0 ? JSON.stringify(recentLtfSwings, null, 2) : '(No new 1m swing points in the last 30 minutes — price is trending without confirmed structure)'}
 
-━━━ RECENT 1m CANDLES (last 15 bars) ━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ RECENT 1m CANDLES (last 10 bars) ━━━━━━━━━━━━━━━━━━━━━━━━━
 ${JSON.stringify(recentBars, null, 2)}
 `;
 
